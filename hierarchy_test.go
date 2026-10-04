@@ -4,11 +4,11 @@ import "testing"
 
 // Hierarchy semantics under test (also documented in README.md):
 // values assigned to a document roll up, so selecting a parent matches
-// every descendant-assigned document. Each facet is counted over the
-// result set with that facet own selection removed. Displayed nodes show
-// subtree union counts; child selection makes ancestors present only the
-// selected subtree total; selecting parent and descendant together unions
-// them and the ancestor dominates.
+// every descendant-assigned document. Every facet is counted over the
+// fully filtered result set; displayed nodes show subtree intersection
+// counts, so child selection makes ancestors present only the selected
+// subtree total, and selecting parent and descendant together unions
+// them with the ancestor dominating.
 func TestHierarchyRollupAndFilter(t *testing.T) {
 	ix := testIndex(t)
 	mustUpsert(t, ix, "p1", Attributes{"cat": {FacetPath{"electronics", "phones", "smartphone"}}})
@@ -147,5 +147,12 @@ func TestHierarchyParentAndChildUnion(t *testing.T) {
 	}
 	if res.Total != 2 {
 		t.Fatalf("parent+child union total = %d, want 2 (parent dominates)", res.Total)
+	}
+	cat := facetMap(res)["cat"]
+	if cat["electronics"].Count != 2 ||
+		cat["electronics\x1fphones"].Count != 2 ||
+		cat["electronics\x1fphones\x1fsmartphone"].Count != 1 ||
+		cat["electronics\x1fphones\x1ffeaturephone"].Count != 1 {
+		t.Fatalf("parent+child counts differ from parent-only view: %+v", cat)
 	}
 }

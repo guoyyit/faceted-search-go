@@ -6,7 +6,6 @@ import "sync"
 // facetCounts[facet][nodeKey] is the candidate count of that node,
 // computed over the base result set.
 type countEntry struct {
-	baseSize    int
 	scope       *resultSet
 	facetCounts map[string]map[string]int
 }

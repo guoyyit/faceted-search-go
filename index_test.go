@@ -135,8 +135,8 @@ func TestMultiSelectORAndCrossFacetAND(t *testing.T) {
 	if fm["size"]["m"].Count != 2 || fm["size"]["l"].Count != 1 {
 		t.Fatalf("linked size counts = %+v", fm["size"])
 	}
-	// The drilled facet still shows alternative counts over other facets'
-	// selection, so green is absent (0) while red/blue are active.
+	// The drilled facet is counted over the same full result set as every
+	// other facet: green is absent (0) while red/blue stay active.
 	if fm["color"]["red"].Count != 2 || !fm["color"]["red"].Active {
 		t.Fatalf("red count = %+v", fm["color"]["red"])
 	}
