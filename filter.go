@@ -32,13 +32,6 @@ func (f Filter) Clone() Filter {
 	return cp
 }
 
-// withoutFacet returns a clone with the given facet's selection removed.
-func (f Filter) withoutFacet(name string) Filter {
-	cp := f.Clone()
-	delete(cp, name)
-	return cp
-}
-
 // cacheKey renders the filter into a stable string key.
 func (f Filter) cacheKey() string {
 	facets := make([]string, 0, len(f))

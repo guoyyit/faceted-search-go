@@ -22,7 +22,9 @@ type Query struct {
 	Limit  int
 	Sort   SortField
 
-	// ReturnCounts requests facet candidate counts alongside the page.
+	// ReturnCounts is kept for source compatibility. Facet counts are
+	// always returned by default alongside the page and the total from a
+	// single consistent snapshot, so this field is now a no-op.
 	ReturnCounts bool
 }
 
@@ -48,7 +50,9 @@ type SearchResult struct {
 	Facets []FacetCounts
 }
 
-// Search executes a query against one consistent snapshot.
+// Search executes a query against one consistent snapshot. The page, the
+// total and every facet count are always returned together and share the
+// same update boundary.
 func (ix *Index) Search(q Query) (SearchResult, error) {
 	if q.Offset < 0 {
 		return SearchResult{}, errors.New("offset must not be negative")
@@ -66,15 +70,10 @@ func (ix *Index) Search(q Query) (SearchResult, error) {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
-	unions := ix.filterUnions(f)
-	base := ix.baseSet(f, unions)
-
-	res := SearchResult{Total: ix.baseSize(base)}
-	res.IDs = ix.paginate(base, q)
-
-	if q.ReturnCounts {
-		res.Facets = ix.linkedCounts(f)
-	}
+	rs := ix.resolveSet(f)
+	res := SearchResult{Total: ix.baseSize(rs)}
+	res.IDs = ix.paginate(rs, q)
+	res.Facets = ix.linkedCounts(f, rs)
 	return res, nil
 }
 
@@ -270,41 +269,38 @@ func (ix *Index) paginate(rs *resultSet, q Query) []DocID {
 	return out
 }
 
-// linkedCounts computes candidate counts for every schema facet. Each facet
-// is counted over the result set with that facet's own selection removed, so
-// the counts stay linked to all other selections and alternative choices
-// remain visible. Hierarchy presentation rules are documented in README.md.
-func (ix *Index) linkedCounts(f Filter) []FacetCounts {
+// linkedCounts computes candidate counts for every schema facet. Every
+// facet, including the facet currently being drilled, is counted over the
+// full result set obtained from the complete filter, so the counts agree
+// with the per-document reference semantics and never exceed the total.
+// Hierarchy presentation rules are documented in README.md.
+func (ix *Index) linkedCounts(f Filter, rs *resultSet) []FacetCounts {
+	entry := ix.countsForFilter(f, rs)
 	out := make([]FacetCounts, 0, len(ix.schema.order))
 	for _, facet := range ix.schema.order {
 		def := ix.schema.facets[facet]
-		scopeFilter := f.withoutFacet(facet)
-		entry := ix.countsForFilter(scopeFilter)
-		values := ix.facetValueCounts(facet, def, entry, ix.postings[facet], f[facet])
+		values := ix.facetValueCounts(def, entry.facetCounts[facet], ix.postings[facet], f[facet])
 		out = append(out, FacetCounts{Facet: facet, Kind: def.Kind, Values: values})
 	}
 	return out
 }
 
-// countsForFilter returns the full vector of raw subtree counts over the
+// countsForFilter returns the full vector of candidate counts over the
 // filter's result set, memoized by canonical filter key. A write bumps the
 // cache epoch, so the vector can never be stale.
-func (ix *Index) countsForFilter(scopeFilter Filter) *countEntry {
-	key := scopeFilter.cacheKey()
+func (ix *Index) countsForFilter(f Filter, rs *resultSet) *countEntry {
+	key := f.cacheKey()
 	if e, ok := ix.cache.get(key); ok {
 		return e
 	}
-	scope := ix.resolveSet(scopeFilter)
 	e := &countEntry{
-		baseSize:    ix.baseSize(scope),
-		scope:       scope,
 		facetCounts: make(map[string]map[string]int, len(ix.schema.order)),
 	}
 	for _, facet := range ix.schema.order {
 		nodes := ix.postings[facet]
 		m := make(map[string]int, len(nodes))
 		for key, list := range nodes {
-			m[key] = countIntersect(scope, list)
+			m[key] = countIntersect(rs, list)
 		}
 		e.facetCounts[facet] = m
 	}
@@ -312,18 +308,14 @@ func (ix *Index) countsForFilter(scopeFilter Filter) *countEntry {
 	return e
 }
 
-func (ix *Index) facetValueCounts(facet string, def FacetDef, entry *countEntry, nodes map[string]*postingList, selected []FacetPath) []FacetValueCount {
-	// selectedUnion is T: the union of the selected subtrees. Ancestor
-	// presentation counts are restricted to T, so selecting a child makes
-	// the parent report the selected subtree total instead of the
-	// unfiltered rollup.
-	selectedUnion := docSet{}
-	for _, sel := range selected {
-		if list := nodes[nodeKey(sel)]; list != nil {
-			unionInto(selectedUnion, list.set)
-		}
-	}
-
+// facetValueCounts builds the visible candidate list for one facet. Each
+// value's count is the number of documents in the result set that carry it
+// (flat facets) or that are assigned to it or any descendant (hierarchy).
+// Zero-count unselected values are hidden; selected values are always
+// returned even when their count is zero. For hierarchy facets the
+// ancestors of a selected node are also shown so the selection path stays
+// visible.
+func (ix *Index) facetValueCounts(def FacetDef, counts map[string]int, nodes map[string]*postingList, selected []FacetPath) []FacetValueCount {
 	paths := knownPaths(nodes)
 	for _, sel := range selected {
 		if nodes[nodeKey(sel)] == nil {
@@ -334,41 +326,18 @@ func (ix *Index) facetValueCounts(facet string, def FacetDef, entry *countEntry,
 
 	values := make([]FacetValueCount, 0, len(paths))
 	for _, p := range paths {
+		count := counts[nodeKey(p)]
 		active := false
-		inside := false
+		ancestorOfSel := false
 		for _, sel := range selected {
 			if facetsEqual(sel, p) {
 				active = true
 			}
-			if isAncestorOrEqual(sel, p) {
-				inside = true
+			if def.Kind == KindHierarchy && isAncestorOrEqual(p, sel) {
+				ancestorOfSel = true
 			}
 		}
-
-		relevant := true
-		if def.Kind == KindHierarchy && len(selected) > 0 {
-			relevant = inside
-			if !relevant {
-				for _, sel := range selected {
-					if isAncestorOrEqual(p, sel) {
-						relevant = true
-						break
-					}
-				}
-			}
-		}
-		if !relevant {
-			continue
-		}
-
-		count := 0
-		count = entry.facetCounts[facet][nodeKey(p)]
-		// Ancestor-only nodes present only the selected subtree union;
-		// nodes inside a selected subtree already belong to T.
-		if def.Kind == KindHierarchy && len(selected) > 0 && !inside {
-			count = ancestorCount(entry, nodes, p, selectedUnion)
-		}
-		if count == 0 && !active {
+		if count == 0 && !active && !ancestorOfSel {
 			continue
 		}
 		values = append(values, FacetValueCount{
@@ -381,7 +350,12 @@ func (ix *Index) facetValueCounts(facet string, def FacetDef, entry *countEntry,
 	return values
 }
 
+// countIntersect reports how many documents in scope also belong to list.
+// A nil list contributes nothing.
 func countIntersect(scope *resultSet, list *postingList) int {
+	if list == nil {
+		return 0
+	}
 	if scope.set == nil {
 		return list.len()
 	}
@@ -397,35 +371,6 @@ func countIntersect(scope *resultSet, list *postingList) int {
 	n := 0
 	for id := range list.set {
 		if scope.set.contains(id) {
-			n++
-		}
-	}
-	return n
-}
-
-// ancestorCount reports how many documents in the count scope are assigned
-// within ancestor's subtree and also inside the selected-subtree union T.
-// It walks T (selected nodes only), so the cost tracks selected values.
-func ancestorCount(entry *countEntry, nodes map[string]*postingList, ancestor FacetPath, allowed docSet) int {
-	list := nodes[nodeKey(ancestor)]
-	if list == nil {
-		return 0
-	}
-	inScope := func(id DocID) bool {
-		return entry.scope.set == nil || entry.scope.set.contains(id)
-	}
-	if len(allowed) <= list.len() {
-		n := 0
-		for id := range allowed {
-			if list.contains(id) && inScope(id) {
-				n++
-			}
-		}
-		return n
-	}
-	n := 0
-	for id := range list.set {
-		if allowed.contains(id) && inScope(id) {
 			n++
 		}
 	}

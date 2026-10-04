@@ -2,17 +2,16 @@ package faceted
 
 import "sync"
 
-// countEntry stores the linked facet counts for one base filter.
-// facetCounts[facet][nodeKey] is the candidate count of that node,
-// computed over the base result set.
+// countEntry stores the candidate count vector for one base filter.
+// facetCounts[facet][nodeKey] is the number of result-set documents
+// carrying that value (flat) or assigned to that node or a descendant
+// (hierarchy). The vector is computed over the filter's full result set.
 type countEntry struct {
-	baseSize    int
-	scope       *resultSet
 	facetCounts map[string]map[string]int
 }
 
-// countCache memoizes linked counts by canonical filter key.
-// Every successful write bumps the epoch, logically invalidating all
+// countCache memoizes result sets and count vectors by canonical filter
+// key. Every successful write bumps the epoch, logically invalidating all
 // entries in O(1); stale entries are lazily discarded.
 type countCache struct {
 	mu      sync.Mutex

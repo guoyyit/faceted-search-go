@@ -177,24 +177,30 @@ func TestConcurrentReadersAndWriters(t *testing.T) {
 	}
 }
 
-// validateSnapshot reacquires the same lock-free view by replaying the
-// response against the snapshot captured inside Search. Since Search holds
-// the read lock only for its own duration, this helper instead validates
-// the response's internal invariants plus per-document re-evaluation by
-// taking its own read lock and checking every returned id still satisfies
-// the filter; mismatches are tolerated only when a write happened between
-// the two read locks. To get a strict check, the structural invariants of
-// the single response itself are verified without a second lock.
+// validateSnapshot checks the structural invariants of a single response
+// that must hold for every consistent snapshot, regardless of when the
+// snapshot was taken. The test index assigns exactly one value per flat
+// facet and one leaf path per document, so:
+//   - every page id is unique and sorted, and the page never exceeds the
+//     limit or the total;
+//   - no candidate count exceeds the total (for every facet, drilled
+//     facets included);
+//   - flat facet candidate counts sum to the total (one contribution per
+//     document);
+//   - hierarchy root count equals the total and leaf counts sum to it.
 func validateSnapshot(t *testing.T, ix *Index, f Filter, res SearchResult) {
 	t.Helper()
 
-	// Every returned page id must be unique.
+	// Every returned page id must be unique and strictly ordered.
 	seen := make(map[DocID]bool, len(res.IDs))
-	for _, id := range res.IDs {
+	for i, id := range res.IDs {
 		if seen[id] {
 			t.Fatalf("duplicate id in page: %s", id)
 		}
 		seen[id] = true
+		if i > 0 && res.IDs[i-1] >= id {
+			t.Fatalf("page not strictly ordered: %v", res.IDs)
+		}
 	}
 	if len(res.IDs) > 13 {
 		t.Fatalf("page size %d exceeds limit", len(res.IDs))
@@ -205,22 +211,70 @@ func validateSnapshot(t *testing.T, ix *Index, f Filter, res SearchResult) {
 		t.Fatalf("page %d > total %d", len(res.IDs), res.Total)
 	}
 
-	// Non-drilled facet counts must be bounded by total, because they are
-	// computed over the fully filtered result set. Drilled facets may show
-	// counts over the scope without that facet selection.
 	for _, fc := range res.Facets {
-		_, drilled := f[fc.Facet]
-		if drilled {
-			continue
-		}
+		sum := 0
+		leafSum := 0
+		hasRoot := false
+		rootCount := 0
+		childSum := make(map[string]int)
 		for _, v := range fc.Values {
+			// No candidate count may exceed the total, including the
+			// drilled facet.
 			if v.Count > res.Total {
 				t.Fatalf("facet %s value %v count %d > total %d",
 					fc.Facet, v.Path, v.Count, res.Total)
 			}
+			if fc.Kind == KindFlat {
+				sum += v.Count
+			} else {
+				if len(v.Path) == 1 && v.Path[0] == "root" {
+					hasRoot = true
+					rootCount = v.Count
+				}
+				if len(v.Path) == 3 {
+					leafSum += v.Count
+				}
+				if len(v.Path) > 1 {
+					parent := nodeKey(v.Path[:len(v.Path)-1])
+					childSum[parent] += v.Count
+				}
+			}
+		}
+		if fc.Kind == KindFlat {
+			// One value per document, so counts partition the total.
+			if sum != res.Total {
+				t.Fatalf("facet %s counts sum = %d, want total %d (values %+v)",
+					fc.Facet, sum, res.Total, fc.Values)
+			}
+		} else {
+			// Every document is assigned to the root and to exactly one
+			// leaf, so both the root count and the leaf sum equal total.
+			if !hasRoot {
+				t.Fatalf("facet %s root node missing from %+v", fc.Facet, fc.Values)
+			}
+			if rootCount != res.Total {
+				t.Fatalf("facet %s root count = %d, want total %d", fc.Facet, rootCount, res.Total)
+			}
+			if leafSum != res.Total {
+				t.Fatalf("facet %s leaf sum = %d, want total %d", fc.Facet, leafSum, res.Total)
+			}
+			// Each parent's count must cover its children's combined
+			// counts (rollup); equality holds here since docs are only
+			// assigned to leaves.
+			for parent, cs := range childSum {
+				parentCount := 0
+				for _, v := range fc.Values {
+					if nodeKey(v.Path) == parent {
+						parentCount = v.Count
+					}
+				}
+				if parentCount < cs {
+					t.Fatalf("facet %s parent %s count %d < children sum %d",
+						fc.Facet, parent, parentCount, cs)
+				}
+			}
 		}
 	}
-
 }
 
 func TestSnapshotConsistencyQuiescent(t *testing.T) {
@@ -251,11 +305,9 @@ func TestSnapshotConsistencyQuiescent(t *testing.T) {
 			t.Fatalf("filter %v: page %d, replay %d", f, len(res.IDs), len(matched))
 		}
 
-		// Verify each non-drilled facet value count by per-document replay.
+		// Verify every facet value count (drilled included) by
+		// per-document replay over the fully filtered result set.
 		for _, fc := range res.Facets {
-			if _, drilled := f[fc.Facet]; drilled {
-				continue
-			}
 			for _, v := range fc.Values {
 				want := 0
 				for _, doc := range ix.docs {
